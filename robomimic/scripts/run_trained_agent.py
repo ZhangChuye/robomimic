@@ -53,6 +53,7 @@ Example usage:
 """
 import argparse
 import json
+import os
 import h5py
 import imageio
 import numpy as np
@@ -178,48 +179,44 @@ def rollout(policy, env, horizon, render=False, video_writer=None, video_skip=5,
 def run_trained_agent(args):
     # some arg checking
     write_video = (args.video_path is not None)
-    assert not (args.render and write_video) # either on-screen or video but not both
+    write_video_dir = (args.video_dir is not None)
+    has_any_video = write_video or write_video_dir
+    assert not (args.render and has_any_video)
     if args.render:
-        # on-screen rendering can only support one camera
         assert len(args.camera_names) == 1
 
-    # relative path to agent
     ckpt_path = args.agent
-
-    # device
     device = TorchUtils.get_torch_device(try_to_use_cuda=True)
 
-    # restore policy
     policy, ckpt_dict = FileUtils.policy_from_checkpoint(ckpt_path=ckpt_path, device=device, verbose=True)
 
-    # read rollout settings
     rollout_num_episodes = args.n_rollouts
     rollout_horizon = args.horizon
     if rollout_horizon is None:
-        # read horizon from config
         config, _ = FileUtils.config_from_checkpoint(ckpt_dict=ckpt_dict)
         rollout_horizon = config.experiment.rollout.horizon
 
-    # create environment from saved checkpoint
     env, _ = FileUtils.env_from_checkpoint(
         ckpt_dict=ckpt_dict, 
         env_name=args.env, 
         render=args.render, 
-        render_offscreen=(args.video_path is not None), 
+        render_offscreen=has_any_video, 
         verbose=True,
     )
 
-    # maybe set seed
     if args.seed is not None:
         np.random.seed(args.seed)
         torch.manual_seed(args.seed)
 
-    # maybe create video writer
+    # single combined video writer (--video_path)
     video_writer = None
     if write_video:
-        video_writer = imageio.get_writer(args.video_path, fps=20)
+        video_writer = imageio.get_writer(args.video_path, fps=20, format="FFMPEG")
 
-    # maybe open hdf5 to write rollouts
+    # per-episode video directory (--video_dir)
+    if write_video_dir:
+        os.makedirs(args.video_dir, exist_ok=True)
+
     write_dataset = (args.dataset_path is not None)
     if write_dataset:
         data_writer = h5py.File(args.dataset_path, "w")
@@ -228,20 +225,35 @@ def run_trained_agent(args):
 
     rollout_stats = []
     for i in range(rollout_num_episodes):
+        ep_video_writer = None
+        if write_video_dir:
+            ep_video_path = os.path.join(args.video_dir, "rollout_{}.mp4".format(i))
+            ep_video_writer = imageio.get_writer(ep_video_path, fps=20, format="FFMPEG")
+
+        # use per-episode writer if available, otherwise combined writer
+        active_writer = ep_video_writer if ep_video_writer is not None else video_writer
+
         stats, traj = rollout(
             policy=policy, 
             env=env, 
             horizon=rollout_horizon, 
             render=args.render, 
-            video_writer=video_writer, 
+            video_writer=active_writer, 
             video_skip=args.video_skip, 
             return_obs=(write_dataset and args.dataset_obs),
             camera_names=args.camera_names,
         )
         rollout_stats.append(stats)
 
+        if ep_video_writer is not None:
+            ep_video_writer.close()
+
+        success_str = "SUCCESS" if stats["Success_Rate"] > 0 else "FAIL"
+        print("[Rollout {}/{}] {} | Return: {:.2f} | Horizon: {} | Success: {}".format(
+            i + 1, rollout_num_episodes, success_str, stats["Return"], stats["Horizon"],
+            bool(stats["Success_Rate"])))
+
         if write_dataset:
-            # store transitions
             ep_data_grp = data_grp.create_group("demo_{}".format(i))
             ep_data_grp.create_dataset("actions", data=np.array(traj["actions"]))
             ep_data_grp.create_dataset("states", data=np.array(traj["states"]))
@@ -251,28 +263,63 @@ def run_trained_agent(args):
                 for k in traj["obs"]:
                     ep_data_grp.create_dataset("obs/{}".format(k), data=np.array(traj["obs"][k]))
                     ep_data_grp.create_dataset("next_obs/{}".format(k), data=np.array(traj["next_obs"][k]))
-
-            # episode metadata
             if "model" in traj["initial_state_dict"]:
-                ep_data_grp.attrs["model_file"] = traj["initial_state_dict"]["model"] # model xml for this episode
-            ep_data_grp.attrs["num_samples"] = traj["actions"].shape[0] # number of transitions in this episode
+                ep_data_grp.attrs["model_file"] = traj["initial_state_dict"]["model"]
+            ep_data_grp.attrs["num_samples"] = traj["actions"].shape[0]
             total_samples += traj["actions"].shape[0]
 
     rollout_stats = TensorUtils.list_of_flat_dict_to_dict_of_list(rollout_stats)
     avg_rollout_stats = { k : np.mean(rollout_stats[k]) for k in rollout_stats }
     avg_rollout_stats["Num_Success"] = np.sum(rollout_stats["Success_Rate"])
+
+    print("\n" + "=" * 60)
+    print("Per-Episode Results:")
+    print("=" * 60)
+    per_episode_results = []
+    for i in range(rollout_num_episodes):
+        s = "SUCCESS" if rollout_stats["Success_Rate"][i] > 0 else "FAIL"
+        print("  Episode {:3d}: {} | Return: {:.2f} | Horizon: {}".format(
+            i, s, rollout_stats["Return"][i], int(rollout_stats["Horizon"][i])))
+        per_episode_results.append({
+            "episode": i,
+            "success": bool(rollout_stats["Success_Rate"][i] > 0),
+            "return": float(rollout_stats["Return"][i]),
+            "horizon": int(rollout_stats["Horizon"][i]),
+        })
+    print("=" * 60)
     print("Average Rollout Stats")
     print(json.dumps(avg_rollout_stats, indent=4))
 
     if write_video:
         video_writer.close()
 
+    if write_video_dir:
+        print("Saved per-episode videos to: {}".format(args.video_dir))
+
     if write_dataset:
-        # global metadata
         data_grp.attrs["total"] = total_samples
-        data_grp.attrs["env_args"] = json.dumps(env.serialize(), indent=4) # environment info
+        data_grp.attrs["env_args"] = json.dumps(env.serialize(), indent=4)
         data_writer.close()
         print("Wrote dataset trajectories to {}".format(args.dataset_path))
+
+    # save detailed stats to JSON alongside videos or checkpoint
+    stats_output = {
+        "checkpoint": ckpt_path,
+        "n_rollouts": rollout_num_episodes,
+        "horizon": rollout_horizon,
+        "seed": args.seed,
+        "average_stats": {k: float(v) for k, v in avg_rollout_stats.items()},
+        "per_episode": per_episode_results,
+    }
+    stats_path = None
+    if write_video_dir:
+        stats_path = os.path.join(args.video_dir, "rollout_stats.json")
+    elif write_video:
+        stats_path = args.video_path.replace(".mp4", "_stats.json")
+    if stats_path:
+        with open(stats_path, "w") as f:
+            json.dump(stats_output, f, indent=4)
+        print("Saved rollout stats to: {}".format(stats_path))
 
 
 if __name__ == "__main__":
@@ -324,6 +371,14 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="(optional) render rollouts to this video file path",
+    )
+
+    # Save per-episode rollout videos to a directory
+    parser.add_argument(
+        "--video_dir",
+        type=str,
+        default=None,
+        help="(optional) save individual per-episode rollout videos to this directory",
     )
 
     # How often to write video frames during the rollout
